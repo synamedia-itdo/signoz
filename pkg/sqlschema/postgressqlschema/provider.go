@@ -1,0 +1,382 @@
+package postgressqlschema
+
+import (
+	"context"
+	"database/sql"
+	"strings"
+
+	"github.com/uptrace/bun"
+
+	"github.com/SigNoz/signoz/pkg/errors"
+	"github.com/SigNoz/signoz/pkg/factory"
+	"github.com/SigNoz/signoz/pkg/sqlschema"
+	"github.com/SigNoz/signoz/pkg/sqlstore"
+)
+
+type provider struct {
+	settings factory.ScopedProviderSettings
+	fmter    sqlschema.SQLFormatter
+	sqlstore sqlstore.SQLStore
+	operator sqlschema.SQLOperator
+}
+
+func NewFactory(sqlstore sqlstore.SQLStore) factory.ProviderFactory[sqlschema.SQLSchema, sqlschema.Config] {
+	return factory.NewProviderFactory(factory.MustNewName("postgres"), func(ctx context.Context, providerSettings factory.ProviderSettings, config sqlschema.Config) (sqlschema.SQLSchema, error) {
+		return New(ctx, providerSettings, config, sqlstore)
+	})
+}
+
+func New(ctx context.Context, providerSettings factory.ProviderSettings, config sqlschema.Config, sqlstore sqlstore.SQLStore) (sqlschema.SQLSchema, error) {
+	settings := factory.NewScopedProviderSettings(providerSettings, "github.com/SigNoz/signoz/pkg/sqlschema/postgressqlschema")
+	fmter := Formatter{sqlschema.NewFormatter(sqlstore.BunDB().Dialect())}
+
+	return &provider{
+		fmter:    fmter,
+		settings: settings,
+		sqlstore: sqlstore,
+		// Postgres supports native ALTER TABLE for constraints, IF [NOT] EXISTS on
+		// column add/drop, and ALTER COLUMN SET/DROP. So, unlike SQLite, it does not
+		// need the create-temp-copy-drop-rename table recreation dance.
+		operator: sqlschema.NewOperator(fmter, sqlschema.OperatorSupport{
+			SCreateAndDropConstraint:                        true,
+			SAlterTableAddAndDropColumnIfNotExistsAndExists: true,
+			SAlterTableAlterColumnSetAndDrop:                true,
+		}),
+	}, nil
+}
+
+func (provider *provider) Formatter() sqlschema.SQLFormatter {
+	return provider.fmter
+}
+
+func (provider *provider) Operator() sqlschema.SQLOperator {
+	return provider.operator
+}
+
+func (provider *provider) GetTable(ctx context.Context, tableName sqlschema.TableName) (*sqlschema.Table, []*sqlschema.UniqueConstraint, error) {
+	var columnRows []struct {
+		ColumnName    string         `bun:"column_name"`
+		DataType      string         `bun:"data_type"`
+		IsNullable    string         `bun:"is_nullable"`
+		ColumnDefault sql.NullString `bun:"column_default"`
+	}
+	if err := provider.
+		sqlstore.
+		BunDB().
+		NewRaw(
+			`SELECT column_name, data_type, is_nullable, column_default `+
+				`FROM information_schema.columns `+
+				`WHERE table_schema = current_schema() AND table_name = ? `+
+				`ORDER BY ordinal_position`,
+			string(tableName),
+		).
+		Scan(ctx, &columnRows); err != nil {
+		return nil, nil, provider.sqlstore.WrapNotFoundErrf(err, errors.CodeNotFound, "table (%s) not found", tableName)
+	}
+
+	if len(columnRows) == 0 {
+		return nil, nil, errors.Newf(errors.TypeNotFound, errors.CodeNotFound, "table (%s) not found", tableName)
+	}
+
+	columns := make([]*sqlschema.Column, 0, len(columnRows))
+	for _, row := range columnRows {
+		columns = append(columns, &sqlschema.Column{
+			Name:     sqlschema.ColumnName(row.ColumnName),
+			DataType: provider.fmter.DataTypeOf(row.DataType),
+			Nullable: strings.EqualFold(row.IsNullable, "YES"),
+			Default:  normalizeDefault(row.ColumnDefault.String),
+		})
+	}
+
+	table := &sqlschema.Table{
+		Name:    tableName,
+		Columns: columns,
+	}
+
+	primaryKeyConstraint, err := provider.getPrimaryKeyConstraint(ctx, tableName)
+	if err != nil {
+		return nil, nil, err
+	}
+	table.PrimaryKeyConstraint = primaryKeyConstraint
+
+	foreignKeyConstraints, err := provider.getForeignKeyConstraints(ctx, tableName)
+	if err != nil {
+		return nil, nil, err
+	}
+	table.ForeignKeyConstraints = foreignKeyConstraints
+
+	uniqueConstraints, err := provider.getUniqueConstraints(ctx, tableName)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return table, uniqueConstraints, nil
+}
+
+func (provider *provider) getPrimaryKeyConstraint(ctx context.Context, tableName sqlschema.TableName) (*sqlschema.PrimaryKeyConstraint, error) {
+	var rows []struct {
+		ConstraintName string `bun:"constraint_name"`
+		ColumnName     string `bun:"column_name"`
+	}
+	if err := provider.
+		sqlstore.
+		BunDB().
+		NewRaw(
+			`SELECT tc.constraint_name, kcu.column_name `+
+				`FROM information_schema.table_constraints tc `+
+				`JOIN information_schema.key_column_usage kcu `+
+				`ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema `+
+				`WHERE tc.table_schema = current_schema() AND tc.table_name = ? AND tc.constraint_type = 'PRIMARY KEY' `+
+				`ORDER BY kcu.ordinal_position`,
+			string(tableName),
+		).
+		Scan(ctx, &rows); err != nil {
+		return nil, err
+	}
+
+	if len(rows) == 0 {
+		return nil, nil
+	}
+
+	columnNames := make([]sqlschema.ColumnName, 0, len(rows))
+	for _, row := range rows {
+		columnNames = append(columnNames, sqlschema.ColumnName(row.ColumnName))
+	}
+
+	constraint := &sqlschema.PrimaryKeyConstraint{ColumnNames: columnNames}
+	// Override the autogenerated name with the actual constraint name from the database.
+	return constraint.Named(rows[0].ConstraintName).(*sqlschema.PrimaryKeyConstraint), nil
+}
+
+func (provider *provider) getForeignKeyConstraints(ctx context.Context, tableName sqlschema.TableName) ([]*sqlschema.ForeignKeyConstraint, error) {
+	var rows []struct {
+		ConstraintName   string `bun:"constraint_name"`
+		ColumnName       string `bun:"column_name"`
+		ReferencedTable  string `bun:"referenced_table"`
+		ReferencedColumn string `bun:"referenced_column"`
+	}
+	if err := provider.
+		sqlstore.
+		BunDB().
+		NewRaw(
+			`SELECT tc.constraint_name, kcu.column_name, ccu.table_name AS referenced_table, ccu.column_name AS referenced_column `+
+				`FROM information_schema.table_constraints tc `+
+				`JOIN information_schema.key_column_usage kcu `+
+				`ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema `+
+				`JOIN information_schema.constraint_column_usage ccu `+
+				`ON tc.constraint_name = ccu.constraint_name AND tc.table_schema = ccu.table_schema `+
+				`WHERE tc.table_schema = current_schema() AND tc.table_name = ? AND tc.constraint_type = 'FOREIGN KEY'`,
+			string(tableName),
+		).
+		Scan(ctx, &rows); err != nil {
+		return nil, err
+	}
+
+	constraints := make([]*sqlschema.ForeignKeyConstraint, 0, len(rows))
+	for _, row := range rows {
+		constraint := &sqlschema.ForeignKeyConstraint{
+			ReferencingColumnName: sqlschema.ColumnName(row.ColumnName),
+			ReferencedTableName:   sqlschema.TableName(row.ReferencedTable),
+			ReferencedColumnName:  sqlschema.ColumnName(row.ReferencedColumn),
+		}
+		constraints = append(constraints, constraint.Named(row.ConstraintName).(*sqlschema.ForeignKeyConstraint))
+	}
+
+	return constraints, nil
+}
+
+func (provider *provider) getUniqueConstraints(ctx context.Context, tableName sqlschema.TableName) ([]*sqlschema.UniqueConstraint, error) {
+	var rows []struct {
+		ConstraintName string `bun:"constraint_name"`
+		ColumnName     string `bun:"column_name"`
+	}
+	if err := provider.
+		sqlstore.
+		BunDB().
+		NewRaw(
+			`SELECT tc.constraint_name, kcu.column_name `+
+				`FROM information_schema.table_constraints tc `+
+				`JOIN information_schema.key_column_usage kcu `+
+				`ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema `+
+				`WHERE tc.table_schema = current_schema() AND tc.table_name = ? AND tc.constraint_type = 'UNIQUE' `+
+				`ORDER BY tc.constraint_name, kcu.ordinal_position`,
+			string(tableName),
+		).
+		Scan(ctx, &rows); err != nil {
+		return nil, err
+	}
+
+	// Group consecutive rows by constraint name (the query is ordered by it).
+	constraints := []*sqlschema.UniqueConstraint{}
+	columnsByConstraint := map[string][]sqlschema.ColumnName{}
+	order := []string{}
+	for _, row := range rows {
+		if _, ok := columnsByConstraint[row.ConstraintName]; !ok {
+			order = append(order, row.ConstraintName)
+		}
+		columnsByConstraint[row.ConstraintName] = append(columnsByConstraint[row.ConstraintName], sqlschema.ColumnName(row.ColumnName))
+	}
+
+	for _, name := range order {
+		constraint := &sqlschema.UniqueConstraint{ColumnNames: columnsByConstraint[name]}
+		constraints = append(constraints, constraint.Named(name).(*sqlschema.UniqueConstraint))
+	}
+
+	return constraints, nil
+}
+
+func (provider *provider) GetIndices(ctx context.Context, tableName sqlschema.TableName) ([]sqlschema.Index, error) {
+	var rows []struct {
+		IndexName       string `bun:"index_name"`
+		IsUnique        bool   `bun:"is_unique"`
+		IsPartial       bool   `bun:"is_partial"`
+		IsPrimary       bool   `bun:"is_primary"`
+		BacksConstraint bool   `bun:"backs_constraint"`
+		Def             string `bun:"def"`
+	}
+	if err := provider.
+		sqlstore.
+		BunDB().
+		NewRaw(
+			`SELECT i.relname AS index_name, ix.indisunique AS is_unique, (ix.indpred IS NOT NULL) AS is_partial, `+
+				`ix.indisprimary AS is_primary, (con.oid IS NOT NULL) AS backs_constraint, pg_get_indexdef(ix.indexrelid) AS def `+
+				`FROM pg_index ix `+
+				`JOIN pg_class i ON i.oid = ix.indexrelid `+
+				`JOIN pg_class t ON t.oid = ix.indrelid `+
+				`JOIN pg_namespace n ON n.oid = t.relnamespace `+
+				`LEFT JOIN pg_constraint con ON con.conindid = ix.indexrelid `+
+				`WHERE n.nspname = current_schema() AND t.relname = ?`,
+			string(tableName),
+		).
+		Scan(ctx, &rows); err != nil {
+		return nil, provider.sqlstore.WrapNotFoundErrf(err, errors.CodeNotFound, "no indices for table (%s) found", tableName)
+	}
+
+	indices := []sqlschema.Index{}
+	for _, row := range rows {
+		// Skip indices that back a primary-key or unique constraint; those are
+		// managed as constraints, mirroring the SQLite provider which skips
+		// origin "pk"/"u" indices.
+		if row.IsPrimary || row.BacksConstraint {
+			continue
+		}
+
+		// The SQLite provider only surfaces unique (and partial-unique) indices.
+		if !row.IsUnique {
+			continue
+		}
+
+		columnNames, where := parseIndexDef(row.Def)
+
+		if row.IsPartial {
+			index := &sqlschema.PartialUniqueIndex{
+				TableName:   tableName,
+				ColumnNames: columnNames,
+				Where:       where,
+			}
+			if index.Name() == row.IndexName {
+				indices = append(indices, index)
+			} else {
+				indices = append(indices, index.Named(row.IndexName))
+			}
+			continue
+		}
+
+		index := &sqlschema.UniqueIndex{
+			TableName:   tableName,
+			ColumnNames: columnNames,
+		}
+		if index.Name() == row.IndexName {
+			indices = append(indices, index)
+		} else {
+			indices = append(indices, index.Named(row.IndexName))
+		}
+	}
+
+	return indices, nil
+}
+
+func (provider *provider) ToggleFKEnforcement(ctx context.Context, db bun.IDB, on bool) error {
+	// session_replication_role = 'replica' disables foreign-key triggers for the
+	// current session; 'origin' restores normal enforcement.
+	role := "replica"
+	if on {
+		role = "origin"
+	}
+
+	if _, err := db.ExecContext(ctx, "SET session_replication_role = '"+role+"'"); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// normalizeDefault strips the type-cast suffix that Postgres records on column
+// defaults (e.g. `'VIEWER'::text` -> `'VIEWER'`), so the introspected default
+// matches the literal a migration set.
+func normalizeDefault(columnDefault string) string {
+	if columnDefault == "" {
+		return ""
+	}
+
+	if idx := strings.Index(columnDefault, "::"); idx != -1 {
+		return strings.TrimSpace(columnDefault[:idx])
+	}
+
+	return strings.TrimSpace(columnDefault)
+}
+
+// parseIndexDef extracts the indexed column names and the (optional) partial
+// WHERE predicate from the output of pg_get_indexdef, which has the shape:
+//
+//	CREATE [UNIQUE] INDEX name ON schema.table USING method (col1, col2) [WHERE (predicate)]
+func parseIndexDef(def string) ([]sqlschema.ColumnName, string) {
+	columnNames := []sqlschema.ColumnName{}
+
+	usingIdx := strings.Index(def, " USING ")
+	if usingIdx == -1 {
+		return columnNames, ""
+	}
+
+	rest := def[usingIdx:]
+	open := strings.Index(rest, "(")
+	if open == -1 {
+		return columnNames, ""
+	}
+
+	// Find the matching close paren for the column list.
+	depth := 0
+	close := -1
+	for i := open; i < len(rest); i++ {
+		switch rest[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				close = i
+			}
+		}
+		if close != -1 {
+			break
+		}
+	}
+	if close == -1 {
+		return columnNames, ""
+	}
+
+	for _, raw := range strings.Split(rest[open+1:close], ",") {
+		column := strings.TrimSpace(raw)
+		column = strings.Trim(column, `"`)
+		if column != "" {
+			columnNames = append(columnNames, sqlschema.ColumnName(column))
+		}
+	}
+
+	where := ""
+	if whereIdx := strings.Index(rest[close:], " WHERE "); whereIdx != -1 {
+		where = strings.TrimSpace(rest[close+whereIdx+len(" WHERE "):])
+	}
+
+	return columnNames, where
+}

@@ -79,10 +79,17 @@ func (agent *Agent) KeepOnlyLast50Agents(ctx context.Context) {
 		Where("agent_id NOT IN (?)",
 			agent.store.BunDB().
 				NewSelect().
-				ColumnExpr("distinct(agent_id)").
+				// GROUP BY agent_id + ORDER BY MAX(created_at) rather than
+				// SELECT DISTINCT agent_id ... ORDER BY created_at, so the query is
+				// valid on both SQLite (lenient) and Postgres (strict: ORDER BY
+				// columns must appear in the SELECT list when DISTINCT is used --
+				// SQLSTATE 42P10). agent_id is unique per row, so grouping is
+				// equivalent to the original dedup intent.
+				ColumnExpr("agent_id").
 				Model(new(opamptypes.StorableAgent)).
 				Where("org_id = ?", agent.OrgID).
-				OrderExpr("created_at DESC").
+				GroupExpr("agent_id").
+				OrderExpr("MAX(created_at) DESC").
 				Limit(50)).
 		Exec(ctx)
 	if err != nil {

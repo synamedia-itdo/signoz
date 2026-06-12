@@ -1,0 +1,144 @@
+package postgressqlstore
+
+import (
+	"context"
+	"database/sql"
+	"log/slog"
+
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/stdlib"
+	"github.com/uptrace/bun"
+	"github.com/uptrace/bun/dialect/pgdialect"
+
+	"github.com/SigNoz/signoz/pkg/errors"
+	"github.com/SigNoz/signoz/pkg/factory"
+	"github.com/SigNoz/signoz/pkg/sqlstore"
+)
+
+const (
+	// Postgres error codes. See https://www.postgresql.org/docs/current/errcodes-appendix.html
+	pgErrUniqueViolation     string = "23505"
+	pgErrForeignKeyViolation string = "23503"
+)
+
+type provider struct {
+	settings  factory.ScopedProviderSettings
+	sqldb     *sql.DB
+	bundb     *sqlstore.BunDB
+	pool      *pgxpool.Pool
+	dialect   *dialect
+	formatter sqlstore.SQLFormatter
+}
+
+// Pooler is implemented by this provider to expose its underlying pgx connection
+// pool. Consumers that need a *pgxpool.Pool rather than a *sql.DB -- such as the
+// OpenFGA Postgres datastore, which builds on a pool -- can type-assert the
+// sqlstore.SQLStore to this interface and share the same pool.
+type Pooler interface {
+	Pool() *pgxpool.Pool
+}
+
+var _ Pooler = (*provider)(nil)
+
+func NewFactory(hookFactories ...factory.ProviderFactory[sqlstore.SQLStoreHook, sqlstore.Config]) factory.ProviderFactory[sqlstore.SQLStore, sqlstore.Config] {
+	return factory.NewProviderFactory(factory.MustNewName("postgres"), func(ctx context.Context, providerSettings factory.ProviderSettings, config sqlstore.Config) (sqlstore.SQLStore, error) {
+		hooks := make([]sqlstore.SQLStoreHook, len(hookFactories))
+		for i, hookFactory := range hookFactories {
+			hook, err := hookFactory.New(ctx, providerSettings, config)
+			if err != nil {
+				return nil, err
+			}
+
+			hooks[i] = hook
+		}
+
+		return New(ctx, providerSettings, config, hooks...)
+	})
+}
+
+func New(ctx context.Context, providerSettings factory.ProviderSettings, config sqlstore.Config, hooks ...sqlstore.SQLStoreHook) (sqlstore.SQLStore, error) {
+	settings := factory.NewScopedProviderSettings(providerSettings, "github.com/SigNoz/signoz/pkg/sqlstore/postgressqlstore")
+
+	poolConfig, err := pgxpool.ParseConfig(config.Postgres.DSN)
+	if err != nil {
+		return nil, errors.Wrapf(err, errors.TypeInvalidInput, errors.CodeInvalidInput, "failed to parse postgres dsn")
+	}
+
+	if config.Connection.MaxOpenConns > 0 {
+		poolConfig.MaxConns = int32(config.Connection.MaxOpenConns)
+	}
+	poolConfig.MaxConnLifetime = config.Connection.MaxConnLifetime
+
+	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
+	if err != nil {
+		return nil, errors.Wrapf(err, errors.TypeInternal, errors.CodeInternal, "failed to create postgres connection pool")
+	}
+
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, errors.Wrapf(err, errors.TypeInternal, errors.CodeInternal, "failed to ping postgres")
+	}
+
+	settings.Logger().InfoContext(ctx, "connected to postgres", slog.String("host", poolConfig.ConnConfig.Host), slog.String("database", poolConfig.ConnConfig.Database))
+
+	sqldb := stdlib.OpenDBFromPool(pool)
+
+	postgresDialect := pgdialect.New()
+	bunDB := sqlstore.NewBunDB(settings, sqldb, postgresDialect, hooks)
+	return &provider{
+		settings:  settings,
+		sqldb:     sqldb,
+		bundb:     bunDB,
+		pool:      pool,
+		dialect:   new(dialect),
+		formatter: newFormatter(bunDB.Dialect()),
+	}, nil
+}
+
+func (provider *provider) BunDB() *bun.DB {
+	return provider.bundb.DB
+}
+
+func (provider *provider) SQLDB() *sql.DB {
+	return provider.sqldb
+}
+
+func (provider *provider) Pool() *pgxpool.Pool {
+	return provider.pool
+}
+
+func (provider *provider) Dialect() sqlstore.SQLDialect {
+	return provider.dialect
+}
+
+func (provider *provider) Formatter() sqlstore.SQLFormatter {
+	return provider.formatter
+}
+
+func (provider *provider) BunDBCtx(ctx context.Context) bun.IDB {
+	return provider.bundb.BunDBCtx(ctx)
+}
+
+func (provider *provider) RunInTxCtx(ctx context.Context, opts *sql.TxOptions, cb func(ctx context.Context) error) error {
+	return provider.bundb.RunInTxCtx(ctx, opts, cb)
+}
+
+func (provider *provider) WrapNotFoundErrf(err error, code errors.Code, format string, args ...any) error {
+	if err == sql.ErrNoRows {
+		return errors.Wrapf(err, errors.TypeNotFound, code, format, args...)
+	}
+
+	return err
+}
+
+func (provider *provider) WrapAlreadyExistsErrf(err error, code errors.Code, format string, args ...any) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		if pgErr.Code == pgErrUniqueViolation || pgErr.Code == pgErrForeignKeyViolation {
+			return errors.Wrapf(err, errors.TypeAlreadyExists, code, format, args...)
+		}
+	}
+
+	return err
+}
