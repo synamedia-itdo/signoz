@@ -129,4 +129,15 @@ var DefaultFeatureSet = []*Feature{
 		UsageLimit: -1,
 		Route:      "",
 	},
+	// Synamedia: SSO is shipped as MIT-licensed code in this community fork
+	// (see pkg/authn/callbackauthn/oidccallbackauthn/). Enable the UI gate so
+	// admins can configure OIDC auth domains. The backend doesn't check this
+	// flag for anything else -- it's purely a frontend toggle.
+	{
+		Name:       SSO,
+		Active:     true,
+		Usage:      0,
+		UsageLimit: -1,
+		Route:      "",
+	},
 }
