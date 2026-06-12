@@ -138,7 +138,7 @@ function ConfigureOIDCAuthnProvider({
 								},
 							]}
 						>
-							<Input id="oidc-client-secret" />
+							<Input.Password id="oidc-client-secret" />
 						</Form.Item>
 					</div>
 
