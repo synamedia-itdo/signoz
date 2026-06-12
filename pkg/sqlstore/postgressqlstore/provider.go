@@ -31,6 +31,16 @@ type provider struct {
 	formatter sqlstore.SQLFormatter
 }
 
+// Pooler is implemented by this provider to expose its underlying pgx connection
+// pool. Consumers that need a *pgxpool.Pool rather than a *sql.DB -- such as the
+// OpenFGA Postgres datastore, which builds on a pool -- can type-assert the
+// sqlstore.SQLStore to this interface and share the same pool.
+type Pooler interface {
+	Pool() *pgxpool.Pool
+}
+
+var _ Pooler = (*provider)(nil)
+
 func NewFactory(hookFactories ...factory.ProviderFactory[sqlstore.SQLStoreHook, sqlstore.Config]) factory.ProviderFactory[sqlstore.SQLStore, sqlstore.Config] {
 	return factory.NewProviderFactory(factory.MustNewName("postgres"), func(ctx context.Context, providerSettings factory.ProviderSettings, config sqlstore.Config) (sqlstore.SQLStore, error) {
 		hooks := make([]sqlstore.SQLStoreHook, len(hookFactories))
@@ -92,6 +102,10 @@ func (provider *provider) BunDB() *bun.DB {
 
 func (provider *provider) SQLDB() *sql.DB {
 	return provider.sqldb
+}
+
+func (provider *provider) Pool() *pgxpool.Pool {
+	return provider.pool
 }
 
 func (provider *provider) Dialect() sqlstore.SQLDialect {

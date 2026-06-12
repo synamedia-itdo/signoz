@@ -169,6 +169,63 @@ under the community build with `SIGNOZ_SQLSTORE_PROVIDER=postgres`.
 
 ---
 
+## 6. Follow-up: Postgres support for the community OpenFGA datastore
+
+Migrating the metadata schema was necessary but not sufficient to *start* the
+community server on Postgres. On startup, after the SQLStore comes up, SigNoz
+initialises the **OpenFGA authorization datastore** via the MIT wrapper
+`pkg/authz/openfgaserver/sqlstore.go`, which only handled the `sqlite` dialect
+and returned `invalid store type: pg` for anything else. This follow-up adds the
+Postgres case.
+
+**Change (2 files, ~20 lines):**
+
+- `pkg/sqlstore/postgressqlstore/provider.go` — add a `Pooler` interface
+  (`Pool() *pgxpool.Pool`), implement it on the provider, and a compile-time
+  `var _ Pooler = (*provider)(nil)` assertion. Needed because OpenFGA's Postgres
+  datastore is built on a `*pgxpool.Pool` (`postgres.NewWithDB(primary, secondary
+  *pgxpool.Pool, cfg)`), whereas the SQLite datastore takes a `*sql.DB`
+  (`sqlite.NewWithDB(*sql.DB, cfg)`) — verified against `openfga v1.14.1`.
+- `pkg/authz/openfgaserver/sqlstore.go` — add `case "pg"` that type-asserts the
+  SQLStore to `postgressqlstore.Pooler` and calls
+  `postgres.NewWithDB(pooler.Pool(), nil, cfg)`, sharing the metadata pool (no
+  second pool; the read-replica arg is `nil`).
+
+**License/clean-room:** both files are MIT (under `pkg/`). The enterprise
+equivalent `ee/authz/openfgaserver/sqlstore.go` was **not opened**. The
+implementation was written from the existing MIT SQLite case in the same file,
+the public OpenFGA library API (`postgres.NewWithDB`), and bun's documented
+dialect name (`"pg"`). No new dependencies (OpenFGA and pgxpool were already
+present). The new case carries a comment marking it as the Synamedia clean-room
+addition.
+
+**OpenFGA schema:** the OpenFGA tables (`store`, `authorization_model`, `tuple`,
+`changelog`) are created by SigNoz's own migrations — they were already produced
+by the §5 migration run — so no separate OpenFGA migration step is required.
+
+**Verification (run 2026-06-12):**
+
+- **Build/vet:** `go build`/`go vet` of `pkg/sqlstore/postgressqlstore`,
+  `pkg/authz/openfgaserver`, and `./cmd/community/` → exit 0 (incl. the
+  compile-time `Pooler` assertion).
+- **Datastore smoke test:** against the migrated `postgres:16`, a temporary gated
+  test built a real `postgressqlstore` and called `openfgaserver.NewSQLStore` (the
+  new `pg` branch) → returned a non-nil datastore; a real `ListStores` query
+  against the migrated `store` table succeeded. (The throwaway test was removed
+  after running; it is not committed.)
+- **No regression:** the existing `openfgaserver` SQLite tests still pass.
+- **Note on `IsReady`:** OpenFGA's `IsReady` reports `false` here because it
+  checks OpenFGA's *own* migration-version bookkeeping, which SigNoz bypasses by
+  owning the schema. This is benign — `IsReady` is not referenced anywhere in
+  SigNoz's authz code, so server startup does not gate on it.
+
+**Still unverified (environment limit):** a full server boot on Postgres
+(listening on :8080 with all dependencies incl. ClickHouse) was not run here; the
+datastore-construction + live-query smoke test is the closest proxy. This is the
+final code piece — the remaining check is the deployment-side end-to-end boot.
+
+---
+
 ## 6. Conclusion
 
 The implementation adds two new MIT packages under `pkg/` plus an additive edit
