@@ -5,6 +5,8 @@ import (
 	"log/slog"
 	"net/url"
 	"path"
+	"slices"
+	"strconv"
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"golang.org/x/oauth2"
@@ -61,13 +63,23 @@ func (a *AuthN) LoginURL(ctx context.Context, siteURL *url.URL, authDomain *auth
 		return "", errors.New(errors.TypeInvalidInput, errors.CodeInvalidInput, "oidc: config is not set on the auth domain")
 	}
 
+	// The siteURL becomes the post-login token-delivery target (carried in the
+	// state). Reject it early unless it is the configured external origin or a
+	// permitted loopback address.
+	if err := a.validateDeliveryTarget(siteURL); err != nil {
+		return "", err
+	}
+
 	ctx = a.clientContext(ctx)
 	oidcProvider, err := a.newProvider(ctx, config)
 	if err != nil {
 		return "", err
 	}
 
-	oauth2Config := a.oauth2Config(siteURL, config, oidcProvider)
+	oauth2Config, err := a.oauth2Config(config, oidcProvider)
+	if err != nil {
+		return "", err
+	}
 
 	return oauth2Config.AuthCodeURL(
 		authtypes.NewState(siteURL, authDomain.StorableAuthDomain().ID).URL.String(),
@@ -88,6 +100,14 @@ func (a *AuthN) HandleCallback(ctx context.Context, query url.Values) (*authtype
 		return nil, errors.Newf(errors.TypeInvalidInput, authtypes.ErrCodeInvalidState, "oidc: invalid state").WithAdditional(err.Error())
 	}
 
+	// Authoritative guardrail: validate the token-delivery target before the token
+	// exchange (and well before any session token is minted). A crafted state must
+	// not be able to deliver a token to an arbitrary host.
+	if err := a.validateDeliveryTarget(state.URL); err != nil {
+		a.settings.Logger().ErrorContext(ctx, "oidc: disallowed redirect target", errors.Attr(err), slog.String("target", state.URL.String()))
+		return nil, err
+	}
+
 	authDomain, err := a.store.GetAuthDomainFromID(ctx, state.DomainID)
 	if err != nil {
 		return nil, err
@@ -103,7 +123,11 @@ func (a *AuthN) HandleCallback(ctx context.Context, query url.Values) (*authtype
 		return nil, err
 	}
 
-	oauth2Config := a.oauth2Config(state.URL, config, oidcProvider)
+	oauth2Config, err := a.oauth2Config(config, oidcProvider)
+	if err != nil {
+		return nil, err
+	}
+
 	token, err := oauth2Config.Exchange(ctx, query.Get("code"))
 	if err != nil {
 		var retrieveError *oauth2.RetrieveError
@@ -201,18 +225,84 @@ func (a *AuthN) newProvider(ctx context.Context, config *authtypes.OIDCConfig) (
 	return provider, nil
 }
 
-func (a *AuthN) oauth2Config(siteURL *url.URL, config *authtypes.OIDCConfig, provider *oidc.Provider) *oauth2.Config {
+func (a *AuthN) oauth2Config(config *authtypes.OIDCConfig, provider *oidc.Provider) (*oauth2.Config, error) {
+	redirectURL, err := a.redirectURL()
+	if err != nil {
+		return nil, err
+	}
+
 	return &oauth2.Config{
 		ClientID:     config.ClientID,
 		ClientSecret: config.ClientSecret,
 		Endpoint:     provider.Endpoint(),
 		Scopes:       scopes,
-		RedirectURL: (&url.URL{
-			Scheme: siteURL.Scheme,
-			Host:   siteURL.Host,
-			Path:   path.Join(a.globalConfig.ExternalPath(), redirectPath),
-		}).String(),
+		RedirectURL:  redirectURL,
+	}, nil
+}
+
+// redirectURL is the fixed OAuth redirect_uri, sourced from SigNoz's own
+// configured external URL (NOT from the client-supplied ref/siteURL). It must be
+// identical between the auth request and the token exchange, and is the URL
+// registered with the IdP. Pinning it here is what lets the post-login delivery
+// target be a validated loopback address while the IdP only ever redirects back
+// to SigNoz.
+func (a *AuthN) redirectURL() (string, error) {
+	ext := a.globalConfig.ExternalURL
+	if ext == nil || ext.Scheme == "" || ext.Host == "" || ext.Host == "<unset>" {
+		return "", errors.New(errors.TypeInvalidInput, errors.CodeInvalidInput, "oidc: global external_url must be configured with a scheme and host to build the OIDC redirect_uri")
 	}
+
+	return (&url.URL{
+		Scheme: ext.Scheme,
+		Host:   ext.Host,
+		Path:   path.Join(a.globalConfig.ExternalPath(), redirectPath),
+	}).String(), nil
+}
+
+// validateDeliveryTarget enforces where SigNoz may deliver the freshly minted
+// session token after login. Because the OAuth redirect_uri is now decoupled
+// from this target (see redirectURL), an unrestricted target would be a
+// session-token-exfiltration open redirect. The only permitted targets are:
+//   - SigNoz's own configured external origin (the standard browser flow), or
+//   - a loopback address (127.0.0.1 / ::1) on an allowlisted port, and only when
+//     loopback delivery is explicitly enabled (off by default).
+func (a *AuthN) validateDeliveryTarget(target *url.URL) error {
+	if target == nil {
+		return errors.New(errors.TypeInvalidInput, errors.CodeInvalidInput, "oidc: redirect target is empty")
+	}
+
+	if ext := a.globalConfig.ExternalURL; ext != nil && ext.Host != "" && ext.Host != "<unset>" &&
+		target.Scheme == ext.Scheme && target.Host == ext.Host {
+		return nil
+	}
+
+	loopback := a.globalConfig.LoopbackRedirect
+	if !loopback.Enabled {
+		return errors.Newf(errors.TypeForbidden, errors.CodeForbidden, "oidc: redirect target host %q is not allowed", target.Host)
+	}
+
+	if target.Scheme != "http" {
+		return errors.New(errors.TypeForbidden, errors.CodeForbidden, "oidc: loopback redirect must use the http scheme")
+	}
+
+	if host := target.Hostname(); host != "127.0.0.1" && host != "::1" {
+		return errors.Newf(errors.TypeForbidden, errors.CodeForbidden, "oidc: loopback redirect host must be 127.0.0.1 or ::1, got %q", host)
+	}
+
+	if target.User != nil {
+		return errors.New(errors.TypeForbidden, errors.CodeForbidden, "oidc: loopback redirect must not contain userinfo")
+	}
+
+	port, err := strconv.Atoi(target.Port())
+	if err != nil || port <= 0 {
+		return errors.New(errors.TypeForbidden, errors.CodeForbidden, "oidc: loopback redirect must specify a valid port")
+	}
+
+	if !slices.Contains(loopback.Ports, port) {
+		return errors.Newf(errors.TypeForbidden, errors.CodeForbidden, "oidc: loopback redirect port %d is not in the allowlist", port)
+	}
+
+	return nil
 }
 
 // clientContext injects the provider-managed HTTP client (tracing, metrics,
