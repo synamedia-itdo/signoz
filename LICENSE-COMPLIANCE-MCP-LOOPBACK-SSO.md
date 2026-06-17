@@ -45,7 +45,7 @@ OIDC provider before any token is minted.
 | **R3** Loopback scheme/shape lock + port allowlist | **Enforced (path clause relaxed)** | Requires `http` scheme, host ∈ {`127.0.0.1`,`::1`}, no userinfo, and a port present in the configured allowlist. **Deviation:** the URL *path* is not pinned to a fixed value (the MCP server chooses its own callback path); loopback-host + port-allowlist + enabled-gate are the load-bearing controls, and the path adds little on a loopback-only target. Noted for review. |
 | **R4** `redirect_uri` pinned to SigNoz | **Enforced** | `redirectURL()` builds the IdP `redirect_uri` solely from `ExternalURL`; identical in `LoginURL` and `HandleCallback`. The client `ref`/`siteURL` can no longer influence the `redirect_uri` — only the (validated) delivery target. |
 | **R5** Anti-injection nonce + loopback bind | **Delegated to MCP client** | SigNoz round-trips the `state` (which the client can populate with a nonce in `ref`); generating/verifying the nonce and binding the loopback listener to `127.0.0.1` are MCP-server responsibilities (documented in the proposal §7). No SigNoz code can enforce this for an external client. |
-| **R6** Minimise token-in-URL (one-time code) | **Deferred (v1 = direct)** | v1 delivers the JWT directly on the validated loopback. R1+R3 make this acceptable (loopback can't leave the host). The authorization-code/back-channel exchange is a tracked fast-follow. |
+| **R6** Minimise token-in-URL (one-time code) | **Accepted as-is (decision 2026-06-17)** | The tokens (`accessToken`/`refreshToken`, opaque — not JWTs) are delivered directly in the loopback redirect query. This is **identical to upstream SigNoz's existing Google/SAML SSO**, which deliver the same tokens in the redirect query via the shared `NewURLValuesFromToken` path (`module.go:172`); a one-time-code + back-channel `/sessions/exchange` endpoint was considered and **declined** to avoid a permanent divergence from upstream for an already-shipped posture. Acceptable because the target is loopback-only (R1/R3, can't leave the host). **Compensating control:** the client-side loopback mitigations (R5) — single-use path nonce, no logging of the callback URL, self-contained success page — are therefore **required, not optional** (SigNoz does not sign the loopback target into `state`, so the client nonce is what binds the delivered token to the intended process). |
 | **R7** No weakening of token lifetime | **Met** | The loopback path reuses the unchanged session-mint path (`module.go:163`, `tokenizer.CreateToken`) and the same rotation/idle/max semantics (`authtypes/token.go`). No new long-lived/non-expiring token. |
 | **R8** Audit | **Partial** | Disallowed targets are logged at `ERROR` with the offending target. A dedicated audit event for *successful* loopback deliveries is a recommended follow-up; the generic login audit path still applies. |
 | **R9** Non-loopback flow unchanged | **Met** | With loopback disabled (default), only the `ExternalURL` origin is permitted — equivalent to prior behaviour. The loopback option is purely additive and gated. |
@@ -114,6 +114,8 @@ The change is MIT, clean-room, and additive. The security-critical control (R1:
 server-side allowlist that prevents the decoupled redirect from becoming a
 token-exfiltration open redirect) is enforced before any token is minted, and the
 capability is off by default and must be explicitly enabled with an explicit port
-allowlist. Remaining items (R5 client nonce, R6 one-time-code, R8 success-audit,
-R3 path-pinning) are documented as client responsibilities or tracked
-follow-ups, none of which weaken the default posture.
+allowlist. R6 (token-in-URL) is **accepted as-is** for parity with upstream
+Google/SAML SSO, with the client-side loopback mitigations (R5) as the required
+compensating control. Remaining items (R5 client nonce, R8 success-audit, R3
+path-pinning) are documented as client responsibilities or tracked follow-ups,
+none of which weaken the default posture.
