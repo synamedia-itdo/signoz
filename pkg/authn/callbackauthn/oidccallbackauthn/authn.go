@@ -6,7 +6,6 @@ import (
 	"net/url"
 	"path"
 	"slices"
-	"strconv"
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"golang.org/x/oauth2"
@@ -293,13 +292,13 @@ func (a *AuthN) validateDeliveryTarget(target *url.URL) error {
 		return errors.New(errors.TypeForbidden, errors.CodeForbidden, "oidc: loopback redirect must not contain userinfo")
 	}
 
-	port, err := strconv.Atoi(target.Port())
-	if err != nil || port <= 0 {
-		return errors.New(errors.TypeForbidden, errors.CodeForbidden, "oidc: loopback redirect must specify a valid port")
+	port := target.Port()
+	if port == "" {
+		return errors.New(errors.TypeForbidden, errors.CodeForbidden, "oidc: loopback redirect must specify a port")
 	}
 
-	if !slices.Contains(loopback.Ports, port) {
-		return errors.Newf(errors.TypeForbidden, errors.CodeForbidden, "oidc: loopback redirect port %d is not in the allowlist", port)
+	if !slices.Contains(loopback.AllowedPorts(), port) {
+		return errors.Newf(errors.TypeForbidden, errors.CodeForbidden, "oidc: loopback redirect port %s is not in the allowlist", port)
 	}
 
 	return nil

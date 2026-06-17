@@ -3,6 +3,7 @@ package global
 import (
 	"net/url"
 	"path"
+	"strconv"
 	"strings"
 
 	"github.com/SigNoz/signoz/pkg/errors"
@@ -34,7 +35,27 @@ type LoopbackRedirectConfig struct {
 
 	// Ports is the allowlist of loopback ports the post-login redirect may target.
 	// Only these ports on 127.0.0.1/::1 are accepted.
-	Ports []int `mapstructure:"ports"`
+	//
+	// Stored as strings (not []int) because env values arrive here as a single
+	// element (e.g. ["47823,47824"]) rather than a split list; AllowedPorts()
+	// normalises both that form and a YAML list by splitting each entry on commas.
+	Ports []string `mapstructure:"ports"`
+}
+
+// AllowedPorts returns the configured loopback ports, flattened and trimmed. It
+// tolerates an env value that arrives as a single comma-joined element (e.g.
+// ["47823,47824"]) as well as a normal list form (["47823","47824"]) by
+// splitting every entry on commas.
+func (c LoopbackRedirectConfig) AllowedPorts() []string {
+	out := make([]string, 0, len(c.Ports))
+	for _, entry := range c.Ports {
+		for _, p := range strings.Split(entry, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				out = append(out, p)
+			}
+		}
+	}
+	return out
 }
 
 func NewConfigFactory() factory.ConfigFactory {
@@ -58,7 +79,7 @@ func newConfig() factory.Config {
 		// is explicitly enabled via loopback_redirect.enabled.
 		LoopbackRedirect: LoopbackRedirectConfig{
 			Enabled: false,
-			Ports:   []int{47823, 47824, 47825, 47826, 47827, 47828, 47829, 47830, 47831, 47832},
+			Ports:   []string{"47823", "47824", "47825", "47826", "47827", "47828", "47829", "47830", "47831", "47832"},
 		},
 	}
 }
@@ -73,12 +94,14 @@ func (c Config) Validate() error {
 	}
 
 	if c.LoopbackRedirect.Enabled {
-		if len(c.LoopbackRedirect.Ports) == 0 {
+		ports := c.LoopbackRedirect.AllowedPorts()
+		if len(ports) == 0 {
 			return errors.NewInvalidInputf(ErrCodeInvalidGlobalConfig, "global::loopback_redirect requires at least one port in 'ports' when enabled")
 		}
-		for _, p := range c.LoopbackRedirect.Ports {
-			if p < 1 || p > 65535 {
-				return errors.NewInvalidInputf(ErrCodeInvalidGlobalConfig, "global::loopback_redirect port %d is out of range (1-65535)", p)
+		for _, p := range ports {
+			n, err := strconv.Atoi(p)
+			if err != nil || n < 1 || n > 65535 {
+				return errors.NewInvalidInputf(ErrCodeInvalidGlobalConfig, "global::loopback_redirect port %q is invalid (must be an integer 1-65535)", p)
 			}
 		}
 	}

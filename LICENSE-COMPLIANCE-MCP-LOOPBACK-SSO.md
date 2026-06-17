@@ -79,8 +79,18 @@ SIGNOZ_GLOBAL_LOOPBACK__REDIRECT_PORTS=47823,47824,47825,47826,47827,47828,47829
 ```
 
 (`__` is the env-mapping literal-underscore escape → `global::loopback_redirect::*`;
-single `_` is the nesting delimiter. The comma list decodes to `[]int` via the
-config decoder's `WeaklyTypedInput` + `StringToSliceHookFunc`.)
+single `_` is the nesting delimiter.)
+
+**On parsing the port list:** koanf delivers the comma-joined env value as a
+*single-element* slice (e.g. `["47823,47824"]`), so a `[]int` field fails at
+startup with `cannot parse value as 'int'`. The field is therefore `[]string`
+(matching the codebase convention for list config, e.g. `identn.Headers`), and
+`LoopbackRedirectConfig.AllowedPorts()` splits each entry on commas — tolerating
+both the env single-element form and a YAML list (`ports: [47823, 47824]`). This
+is verified by an integration test through the real config pipeline
+(`cmd/config_loopback_test.go`). Earlier revisions of this document incorrectly
+claimed the env list decoded via `WeaklyTypedInput` + `StringToSliceHookFunc`;
+that path does not fire for env values here.
 
 ---
 
