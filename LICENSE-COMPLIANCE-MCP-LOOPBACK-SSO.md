@@ -73,7 +73,9 @@ OIDC provider before any token is minted.
 
 ```
 SIGNOZ_GLOBAL_LOOPBACK__REDIRECT_ENABLED=true
-SIGNOZ_GLOBAL_LOOPBACK__REDIRECT_PORTS=8765,8766,8767   # the MCP server's fixed ports
+# PORTS defaults to the MCP server's fixed loopback range 47823-47832, so this
+# is only needed to override it:
+SIGNOZ_GLOBAL_LOOPBACK__REDIRECT_PORTS=47823,47824,47825,47826,47827,47828,47829,47830,47831,47832
 ```
 
 (`__` is the env-mapping literal-underscore escape → `global::loopback_redirect::*`;

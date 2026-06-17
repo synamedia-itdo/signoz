@@ -53,6 +53,13 @@ func newConfig() factory.Config {
 			Host:   "<unset>",
 			Path:   "",
 		},
+		// Loopback delivery is OFF by default. These are the default allowlisted
+		// ports (the MCP server's fixed loopback range) used only once the feature
+		// is explicitly enabled via loopback_redirect.enabled.
+		LoopbackRedirect: LoopbackRedirectConfig{
+			Enabled: false,
+			Ports:   []int{47823, 47824, 47825, 47826, 47827, 47828, 47829, 47830, 47831, 47832},
+		},
 	}
 }
 
