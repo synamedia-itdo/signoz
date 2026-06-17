@@ -12,7 +12,7 @@ func TestNewConfigLoopbackRedirectDefault(t *testing.T) {
 	assert.True(t, ok)
 	// Off by default; ports default to the MCP server's fixed loopback range.
 	assert.False(t, cfg.LoopbackRedirect.Enabled)
-	assert.Equal(t, []int{47823, 47824, 47825, 47826, 47827, 47828, 47829, 47830, 47831, 47832}, cfg.LoopbackRedirect.Ports)
+	assert.Equal(t, []string{"47823", "47824", "47825", "47826", "47827", "47828", "47829", "47830", "47831", "47832"}, cfg.LoopbackRedirect.AllowedPorts())
 }
 
 func TestExternalPath(t *testing.T) {

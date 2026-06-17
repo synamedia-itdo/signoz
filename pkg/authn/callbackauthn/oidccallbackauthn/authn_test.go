@@ -20,7 +20,7 @@ func TestValidateDeliveryTarget(t *testing.T) {
 
 	loopbackOn := global.Config{
 		ExternalURL:      externalURL,
-		LoopbackRedirect: global.LoopbackRedirectConfig{Enabled: true, Ports: []int{8765, 8766}},
+		LoopbackRedirect: global.LoopbackRedirectConfig{Enabled: true, Ports: []string{"8765", "8766"}},
 	}
 	loopbackOff := global.Config{
 		ExternalURL:      externalURL,
