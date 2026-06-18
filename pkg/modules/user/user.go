@@ -50,6 +50,13 @@ type Setter interface {
 	AddUserRole(ctx context.Context, orgID, userID valuer.UUID, roleName string) error
 	RemoveUserRole(ctx context.Context, orgID, userID valuer.UUID, roleID valuer.UUID) error
 
+	// SyncManagedRole reconciles a user's role to exactly managedRoleName,
+	// updating the authz grants (OpenFGA), the user_role table, and invalidating
+	// the cached identity. Used by SSO when role mapping is authoritative so group
+	// membership is honoured on every login. No-op if the role already matches;
+	// never modifies the root user.
+	SyncManagedRole(ctx context.Context, orgID, userID valuer.UUID, managedRoleName string) error
+
 	statsreporter.StatsCollector
 }
 

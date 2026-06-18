@@ -160,6 +160,17 @@ func (module *module) CreateCallbackAuthNSession(ctx context.Context, authNProvi
 		return "", errors.WithAdditionalf(err, "root user can only authenticate via password")
 	}
 
+	// When a role mapping is configured, SSO is authoritative for the user's role:
+	// reconcile it to the mapping result on every login so changes in IdP group
+	// membership are honoured (fail-closed -- a user no longer in any mapped group
+	// is downgraded to the default role). For existing users GetOrCreateUser does
+	// not change the role, so this is what actually keeps roles in sync.
+	if roleMapping.IsAuthoritative() {
+		if err := module.userSetter.SyncManagedRole(ctx, newUser.OrgID, newUser.ID, signozManagedRole); err != nil {
+			return "", err
+		}
+	}
+
 	token, err := module.tokenizer.CreateToken(ctx, authtypes.NewPrincipalUserIdentity(newUser.ID, newUser.OrgID, newUser.Email, authtypes.IdentNProviderTokenizer), map[string]string{})
 	if err != nil {
 		return "", err

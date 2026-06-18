@@ -853,6 +853,52 @@ func (module *setter) UpdateUserRoles(ctx context.Context, orgID, userID valuer.
 	})
 }
 
+func (module *setter) SyncManagedRole(ctx context.Context, orgID, userID valuer.UUID, managedRoleName string) error {
+	existingUser, err := module.getter.GetUserByOrgIDAndID(ctx, orgID, userID)
+	if err != nil {
+		return err
+	}
+
+	// Never reconcile the root user via SSO.
+	if existingUser.ErrIfRoot() != nil {
+		return nil
+	}
+
+	userRoles, err := module.getter.GetRolesByUserID(ctx, userID)
+	if err != nil {
+		return err
+	}
+
+	existingRoleNames := make([]string, len(userRoles))
+	for idx, userRole := range userRoles {
+		existingRoleNames[idx] = userRole.Role.Name
+	}
+
+	// No-op if the role already matches exactly. This avoids re-granting authz and
+	// invalidating the identity (which disrupts the active session) on every login
+	// in the common, unchanged case.
+	if len(existingRoleNames) == 1 && existingRoleNames[0] == managedRoleName {
+		return nil
+	}
+
+	subject := authtypes.MustNewSubject(coretypes.NewResourceUser(), userID.StringValue(), orgID, nil)
+
+	// Update the authz grants (OpenFGA -- the actual enforcement) first. This is
+	// idempotent and intentionally not transactional, mirroring the admin
+	// set-role flow.
+	if err := module.authz.ModifyGrant(ctx, orgID, existingRoleNames, []string{managedRoleName}, subject); err != nil {
+		return err
+	}
+
+	// Reconcile the user_role table (manages its own transaction).
+	if err := module.UpdateUserRoles(ctx, orgID, userID, []string{managedRoleName}); err != nil {
+		return err
+	}
+
+	// Invalidate the cached identity so the new role takes effect immediately.
+	return module.tokenizer.DeleteIdentity(ctx, userID)
+}
+
 func (module *setter) AddUserRole(ctx context.Context, orgID, userID valuer.UUID, roleName string) error {
 	existingUser, err := module.getter.GetUserByOrgIDAndID(ctx, orgID, userID)
 	if err != nil {
