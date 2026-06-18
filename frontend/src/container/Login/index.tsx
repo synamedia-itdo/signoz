@@ -211,9 +211,25 @@ function Login(): JSX.Element {
 			}
 			if (isCallbackAuthN) {
 				const url = form.getFieldValue('url');
+				const email = form.getFieldValue('email');
+
+				let redirectUrl = url;
+				try {
+					const parsedUrl = new URL(url);
+					if (email) {
+						// Pass the entered email as the standard OIDC login_hint so the
+						// IdP pre-selects that account (skips the account picker and makes
+						// the email entered here the account that gets signed in as).
+						parsedUrl.searchParams.set('login_hint', email);
+					}
+					redirectUrl = parsedUrl.toString();
+				} catch {
+					// Fall back to the raw URL if it can't be parsed.
+					redirectUrl = url;
+				}
 
 				// oxlint-disable-next-line signoz/no-raw-absolute-path
-				window.location.href = url;
+				window.location.href = redirectUrl;
 			}
 		} catch (error) {
 			setErrorMessage(error as APIError);

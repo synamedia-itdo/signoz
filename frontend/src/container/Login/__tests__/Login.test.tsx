@@ -552,9 +552,12 @@ describe('Login Component', () => {
 			const callbackButton = getByTestId('callback_authn_submit');
 			await user.click(callbackButton);
 
-			// Check that window.location.href was set to the callback URL
+			// Check that window.location.href was set to the callback URL with the
+			// entered email passed as the OIDC login_hint
 			await waitFor(() => {
-				expect(window.location.href).toBe(CALLBACK_AUTHN_URL);
+				const expectedUrl = new URL(CALLBACK_AUTHN_URL);
+				expectedUrl.searchParams.set('login_hint', PASSWORD_AUTHN_EMAIL);
+				expect(window.location.href).toBe(expectedUrl.toString());
 			});
 		});
 	});
