@@ -87,6 +87,19 @@ func (typ *RoleMapping) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// IsAuthoritative reports whether the role mapping is configured such that SSO
+// should determine the user's role on every login. It is true when a real
+// mapping mechanism is present -- group-to-role mappings or a role attribute. A
+// bare default role does not, on its own, make SSO authoritative (otherwise an
+// org that assigns roles by hand would have everyone reset on each login).
+func (roleMapping *RoleMapping) IsAuthoritative() bool {
+	if roleMapping == nil {
+		return false
+	}
+
+	return len(roleMapping.GroupMappings) > 0 || roleMapping.UseRoleAttribute
+}
+
 func (roleMapping *RoleMapping) NewRoleFromCallbackIdentity(callbackIdentity *CallbackIdentity) types.Role {
 	if roleMapping == nil {
 		return types.RoleViewer

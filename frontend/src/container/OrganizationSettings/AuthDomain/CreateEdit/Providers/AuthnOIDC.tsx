@@ -186,7 +186,8 @@ function ConfigureOIDCAuthnProvider({
 					</div>
 					<div className="authn-provider__callout-wrapper">
 						<Callout type="warning" size="small" showIcon className="callout">
-							OIDC won&apos;t be enabled unless you enter all the attributes above
+							OIDC won&apos;t be enabled until the required fields above are filled in
+							(Issuer Alias is optional)
 						</Callout>
 					</div>
 				</div>
