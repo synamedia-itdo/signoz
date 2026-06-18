@@ -53,7 +53,11 @@ func (attr *AttributeMapping) UnmarshalJSON(data []byte) error {
 type RoleMapping struct {
 	// Default role any new SSO users. Defaults to "VIEWER"
 	DefaultRole string `json:"defaultRole"`
-	// Map of IDP group names to SigNoz roles. Key is group name, value is SigNoz role
+	// Map of IdP group identifier to SigNoz role. The key is matched by exact,
+	// case-sensitive string equality against the values in the IdP's groups
+	// claim, so it must be exactly what the IdP emits -- for Microsoft Entra ID
+	// that is the group Object ID (GUID), not the display name. Value is the
+	// SigNoz role. See ENTRA-GROUP-ROLE-MAPPING-SETUP.md.
 	GroupMappings map[string]string `json:"groupMappings"`
 	// If true, use the role claim directly from IDP instead of group mappings
 	UseRoleAttribute bool `json:"useRoleAttribute"`

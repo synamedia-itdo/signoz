@@ -152,7 +152,10 @@ function RoleMappingSection({
 										Group to Role Mappings
 									</span>
 									<p className="role-mapping-section__group-description">
-										Map IDP group names to SigNoz roles. If a user belongs to multiple
+										Map IDP groups to SigNoz roles. Use the group identifier exactly as
+										your IDP emits it in the groups claim — for Microsoft Entra ID this
+										is the group Object ID (GUID), not the display name. If a user
+										belongs to multiple
 										groups, the highest privilege role will be assigned.
 									</p>
 								</div>
@@ -165,9 +168,9 @@ function RoleMappingSection({
 													<Form.Item
 														name={[field.name, 'groupName']}
 														className="role-mapping-section__field role-mapping-section__field--group"
-														rules={[{ required: true, message: 'Group name is required' }]}
+														rules={[{ required: true, message: 'Group identifier is required' }]}
 													>
-														<Input placeholder="IDP Group Name" />
+														<Input placeholder="IDP group ID (Entra: Object ID)" />
 													</Form.Item>
 
 													<Form.Item
